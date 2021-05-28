@@ -240,6 +240,78 @@ func TestNewBatchSpanProcessorWithOptions(t *testing.T) {
 	}
 }
 
+func TestNewBatchSpanProcessorWithMetricReceivers(t *testing.T) {
+	schDelay := 200 * time.Millisecond
+
+	var exportSize int
+	var exportDuration time.Duration
+	var queueLen []int
+
+	option := testOption{
+		name: "parallel span blocking",
+		o: []sdktrace.BatchSpanProcessorOption{
+			sdktrace.WithBatchTimeout(schDelay),
+			sdktrace.WithMaxExportBatchSize(5),
+			sdktrace.WithExportSizeReceiver(func(_ context.Context, i int) {
+				exportSize = i
+			}),
+			sdktrace.WithExportDurationReceiver(func(_ context.Context, duration time.Duration) {
+				exportDuration = duration
+			}),
+			sdktrace.WithQueueLengthReceiver(func(_ context.Context, i int) {
+				queueLen = append(queueLen, i)
+			}),
+		},
+		wantNumSpans: 5,
+		genNumSpans:  5,
+		parallel:     true,
+	}
+
+	te := testBatchExporter{}
+	tp := basicTracerProvider(t)
+	ssp := createAndRegisterBatchSP(option, &te)
+	if ssp == nil {
+		t.Fatalf("%s: Error creating new instance of BatchSpanProcessor\n", option.name)
+	}
+	tp.RegisterSpanProcessor(ssp)
+	tr := tp.Tracer("BatchSpanProcessorWithOptions")
+
+	generateSpan(t, option.parallel, tr, option)
+
+	tp.UnregisterSpanProcessor(ssp)
+
+	if exportDuration <= 0 {
+		t.Errorf("export duration should be above zero")
+	}
+
+	if exportSize != option.wantNumSpans {
+		t.Errorf("number of exported span: got %+v, want %+v\n",
+			exportSize, option.wantNumSpans)
+	}
+
+	if len(queueLen) != 5 {
+		t.Errorf("queue receiver should receive all spans: got %+v", queueLen)
+	}
+
+	gotNumOfSpans := te.len()
+	if option.wantNumSpans > 0 && option.wantNumSpans != gotNumOfSpans {
+		t.Errorf("number of exported span: got %+v, want %+v\n",
+			gotNumOfSpans, option.wantNumSpans)
+	}
+
+	gotBatchCount := te.getBatchCount()
+	if option.wantBatchCount > 0 && gotBatchCount < option.wantBatchCount {
+		t.Errorf("number batches: got %+v, want >= %+v\n",
+			gotBatchCount, option.wantBatchCount)
+		t.Errorf("Batches %v\n", te.sizes)
+	}
+
+	if option.wantExportTimeout && te.err != context.DeadlineExceeded {
+		t.Errorf("context deadline: got err %+v, want %+v\n",
+			te.err, context.DeadlineExceeded)
+	}
+}
+
 func createAndRegisterBatchSP(option testOption, te *testBatchExporter) sdktrace.SpanProcessor {
 	// Always use blocking queue to avoid flaky tests.
 	options := append(option.o, sdktrace.WithBlocking())

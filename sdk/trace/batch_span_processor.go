@@ -60,6 +60,16 @@ type BatchSpanProcessorOptions struct {
 	// Blocking option should be used carefully as it can severely affect the performance of an
 	// application.
 	BlockOnQueueFull bool
+
+	// QueueLengthReceiver is a function that, if set, will have the current size of the queue
+	// reported when new spans are added
+	QueueLengthReceiver func(context.Context, int)
+
+	// ExportDurationReceiver is used for reporting the duration the last export took
+	ExportDurationReceiver func(context.Context, time.Duration)
+
+	// ExportSizeReceiver is used for reporting the number of spans in the last export
+	ExportSizeReceiver func(context.Context, int)
 }
 
 // batchSpanProcessor is a SpanProcessor that batches asynchronously-received
@@ -201,9 +211,34 @@ func WithBlocking() BatchSpanProcessorOption {
 	}
 }
 
+func WithQueueLengthReceiver(receiver func (context.Context, int)) BatchSpanProcessorOption {
+	return func (o *BatchSpanProcessorOptions) {
+		o.QueueLengthReceiver = receiver
+	}
+}
+
+func WithExportDurationReceiver(receiver func (context.Context, time.Duration)) BatchSpanProcessorOption {
+	return func (o *BatchSpanProcessorOptions) {
+		o.ExportDurationReceiver = receiver
+	}
+}
+
+func WithExportSizeReceiver(receiver func (context.Context, int)) BatchSpanProcessorOption {
+	return func (o *BatchSpanProcessorOptions) {
+		o.ExportSizeReceiver = receiver
+	}
+}
+
 // exportSpans is a subroutine of processing and draining the queue.
 func (bsp *batchSpanProcessor) exportSpans(ctx context.Context) error {
 	bsp.timer.Reset(bsp.o.BatchTimeout)
+
+	start := time.Now()
+	defer func() {
+		if bsp.o.ExportDurationReceiver != nil {
+			bsp.o.ExportDurationReceiver(ctx, time.Since(start))
+		}
+	}()
 
 	bsp.batchMutex.Lock()
 	defer bsp.batchMutex.Unlock()
@@ -215,6 +250,9 @@ func (bsp *batchSpanProcessor) exportSpans(ctx context.Context) error {
 	}
 
 	if l := len(bsp.batch); l > 0 {
+		if bsp.o.ExportSizeReceiver != nil {
+			bsp.o.ExportSizeReceiver(ctx, l)
+		}
 		err := bsp.e.ExportSpans(ctx, bsp.batch)
 
 		// A new batch is always created after exporting, even if the batch failed to be exported.
@@ -249,8 +287,12 @@ func (bsp *batchSpanProcessor) processQueue() {
 		case sd := <-bsp.queue:
 			bsp.batchMutex.Lock()
 			bsp.batch = append(bsp.batch, sd)
-			shouldExport := len(bsp.batch) >= bsp.o.MaxExportBatchSize
+			batchLen := len(bsp.batch)
+			shouldExport := batchLen >= bsp.o.MaxExportBatchSize
 			bsp.batchMutex.Unlock()
+			if bsp.o.QueueLengthReceiver != nil {
+				bsp.o.QueueLengthReceiver(ctx, batchLen)
+			}
 			if shouldExport {
 				if !bsp.timer.Stop() {
 					<-bsp.timer.C
